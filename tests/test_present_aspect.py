@@ -78,9 +78,12 @@ VkImage framegen_scale(int, VkImageView, VkImage, uint32_t, uint32_t, const int*
 void blit_crop_to_rect(int, VkImage src, uint32_t, uint32_t, const int* crop, VkImage, int, PresentRect rect) {
     ++blits; drawn = rect; drawn_crop = crop; drawn_source = src;
 }
+bool molten_samples_present() { return false; }
+bool copy_swapchain(int, VkImageView, uint32_t, uint32_t, const int*, uint32_t, PresentRect) { return false; }
 void actual_present(VkImage src, uint32_t sw, uint32_t sh, const int* crop, VkImageView view) {
     struct { int cmd; } f{1};
     VkImage dst = 2;
+    uint32_t index = 0;
 ''' + block + r'''
 }
 void expect(VkImage src, uint32_t sw, uint32_t sh, const int* crop, uint32_t dw, uint32_t dh,

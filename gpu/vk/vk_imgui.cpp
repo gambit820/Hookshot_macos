@@ -430,14 +430,69 @@ void record_to(VkCommandBuffer cmd, VkImage image, VkImageView view, uint32_t w,
     vkCmdBeginRendering(cmd, &ri);
     ImGui_ImplVulkan_RenderDrawData(dd, cmd);
     vkCmdEndRendering(cmd);
+    static int ui_frames;
+    if (ui_frames < 2) {
+        ui_frames++;
+        logf("vk: ui frame %d: %d vertices", ui_frames, dd ? dd->TotalVtxCount : -1);
+    }
     layout(cmd, image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
            VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT);
 }
 
+bool g_swapchain_color;
+
+void record_swapchain(VkCommandBuffer cmd, VkImage image, VkImageView view, uint32_t w, uint32_t h) {
+    ImGui::Render();
+    ImDrawData* dd = ImGui::GetDrawData();
+    presents++;
+    reap(false);
+    if (srgb_target) linearize(dd);
+    else if (dev.hdr) hdr10(dd);
+    if (!image || !view || !dd) return;
+    bool textures_ok = true;
+    if (dd->Textures)
+        for (ImTextureData* tex : *dd->Textures) {
+            if (tex->Status == ImTextureStatus_OK || tex->Status == ImTextureStatus_Destroyed) continue;
+            update_texture(cmd, tex);
+            if (tex->Status != ImTextureStatus_OK && tex->Status != ImTextureStatus_Destroyed) textures_ok = false;
+        }
+    dd->Textures = nullptr;
+    if (!textures_ok) return;
+    // Already COLOR_ATTACHMENT when the present copy drew into it. A TRANSFER_DST transition here would drop that picture.
+    if (!g_swapchain_color)
+        layout(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+               VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+               VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+    VkRenderingAttachmentInfo ca{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    ca.imageView = view;
+    ca.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    ca.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
+    ri.renderArea = {{0, 0}, {w, h}};
+    ri.layerCount = 1;
+    ri.colorAttachmentCount = 1;
+    ri.pColorAttachments = &ca;
+    vkCmdBeginRendering(cmd, &ri);
+    ImGui_ImplVulkan_RenderDrawData(dd, cmd);
+    vkCmdEndRendering(cmd);
+    g_swapchain_color = true;
+}
+
 void record(VkCommandBuffer cmd, uint32_t index, uint32_t w, uint32_t h) {
     const bool has = index < dev.swap_views.size() && dev.swap_views[index];
-    record_to(cmd, has ? dev.swap_images[index] : VK_NULL_HANDLE, has ? dev.swap_views[index] : VK_NULL_HANDLE, w, h);
+    const VkImage image = has ? dev.swap_images[index] : VK_NULL_HANDLE;
+    const VkImageView view = has ? dev.swap_views[index] : VK_NULL_HANDLE;
+#ifdef __APPLE__
+    record_swapchain(cmd, image, view, w, h);
+#else
+    record_to(cmd, image, view, w, h);
+#endif
 }
+
+void swapchain_layout_reset() { g_swapchain_color = false; }
+void swapchain_layout_color(bool color) { g_swapchain_color = color; }
+bool swapchain_layout_is_color() { return g_swapchain_color; }
 
 } // namespace mkwvk::ui

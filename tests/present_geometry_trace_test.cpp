@@ -46,8 +46,10 @@ VkImage framegen_hdr(int, VkImageView, uint32_t, uint32_t, const int*, uint32_t,
 }
 VkImage framegen_scale(int, VkImageView, VkImage, uint32_t, uint32_t, const int*, uint32_t, uint32_t, bool) { return scaled ? 9 : 0; }
 void blit_crop_to_rect(int, VkImage, uint32_t, uint32_t, const int*, VkImage, int, PresentRect rect) { ++blits; drawn = rect; }
+bool molten_samples_present() { return false; }
+bool copy_swapchain(int, VkImageView, uint32_t, uint32_t, const int*, uint32_t, PresentRect) { return false; }
 void present(VkImage src = 1, uint32_t sw = 3440, uint32_t sh = 1440, const int* crop = nullptr, VkImageView view = 2) {
-    struct { int cmd = 1; } f; VkImage dst = 3;
+    struct { int cmd = 1; } f; VkImage dst = 3; uint32_t index = 0;
     /* ACTUAL_DRAW */
     /* ACTUAL_TRACE */
 }

@@ -77,7 +77,8 @@ int a64_call_miss(Ctx *c, uint64_t target) {
     if (!target) {
         /* (hookshot) a callback table entry zeroed at run time: OoT's UpdateTextBoxTextureThread reaches its text release trampoline
            with a null function pointer at the same cutscene point every session. 0 is never a real function; returning 1 turns the
-           tail call into a plain return. chrispository, Hookshot PR 55 */
+           tail call into a plain return. chrispository, Hookshot PR 55. A call (BLR), as opposed to that jump, has already had its
+           x0 set to 0 by a64_icall: the caller's null check is the failure path. */
         static volatile LONG logged;
         if (InterlockedIncrement(&logged) <= 8)
             hos_log("skipped an indirect call to 0 (lr %#llx, thread %s)", (unsigned long long)c->x[30], hos_thread_name(hos_self()));

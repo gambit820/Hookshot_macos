@@ -25,6 +25,11 @@ ImTextureData* logo(float* aspect);
 /// The frame's drawing over the window's image `index` (TRANSFER_DST_OPTIMAL before and after): new glyphs and textures
 /// copied in on cmd first (no wait on the queue), then one render pass
 void record(VkCommandBuffer cmd, uint32_t index, uint32_t w, uint32_t h);
+/// MoltenVK drops a swapchain image that is left in TRANSFER_DST and then moved to PRESENT. The window path can leave
+/// the image COLOR_ATTACHMENT instead; present_image reads this after menu_record.
+void swapchain_layout_reset();
+void swapchain_layout_color(bool color);
+bool swapchain_layout_is_color();
 /// The same over another image (TRANSFER_DST_OPTIMAL before and after, colour-attachment use, a view of it; headless, the
 /// shots' RGBA: vk_replay.cpp RX_VK_SHOT_MENU)
 void record_to(VkCommandBuffer cmd, VkImage image, VkImageView view, uint32_t w, uint32_t h);

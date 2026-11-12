@@ -29,10 +29,13 @@ VkImage framegen_hdr(VkCommandBuffer,VkImageView,uint32_t,uint32_t,const int*,ui
 VkImageView framegen_scaled_view() { return VK_NULL_HANDLE; }
 void full_barrier(VkCommandBuffer) {}
 void logf(const char*,...) {}
+bool molten_samples_present() { return false; }
+bool copy_swapchain(VkCommandBuffer, VkImageView, uint32_t, uint32_t, const int*, uint32_t, PresentRect) { return false; }
 // @PRODUCTION_HELPERS@
 void record_actual(VkCommandBuffer command,VkImage src,uint32_t sw,uint32_t sh,const int* crop,VkImage dst) {
     struct { VkCommandBuffer cmd; } f{command};
     VkImageView view=VK_NULL_HANDLE;
+    uint32_t index = 0;
 // @PRODUCTION_PRESENT@
 }
 uint32_t memory_type(uint32_t bits,VkMemoryPropertyFlags flags) {

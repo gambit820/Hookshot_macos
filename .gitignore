@@ -35,5 +35,10 @@ __pycache__/
 build-linux/
 *.so
 
+.DS_Store
+
 # ---- NVIDIA's DLSS SDK (scripts/ngx_sdk.py): NVIDIA's files, never committed ----
 ngx-sdk/
+
+# macOS share folder from builder/macos/hookshot_builder.py --package
+dist/

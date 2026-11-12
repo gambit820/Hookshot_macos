@@ -1164,6 +1164,33 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
     };
     using DefPtr = Id StorageDefinitions::*;
     const Id zero{u32_zero_value};
+    // (hookshot) MoltenVK cannot alias two arrays on one binding, so a constant buffer is only the U32x4 view.
+    // The storage-buffer address is still the u64 at this byte, and the size the u32 eight bytes on: read them out of that view.
+    const auto cbuf_has_words{[&](u32 cbuf_index) {
+        return (Sirit::ValidId(uniform_types.U32x2) && Sirit::ValidId(cbufs[cbuf_index].U32x2)) ||
+               (Sirit::ValidId(uniform_types.U32x4) && Sirit::ValidId(cbufs[cbuf_index].U32x4)) ||
+               (Sirit::ValidId(uniform_types.U32) && Sirit::ValidId(cbufs[cbuf_index].U32));
+    }};
+    const auto cbuf_u32{[&](u32 cbuf_index, u32 word) -> Id {
+        if (Sirit::ValidId(uniform_types.U32) && Sirit::ValidId(cbufs[cbuf_index].U32)) {
+            const Id pointer{OpAccessChain(uniform_types.U32, cbufs[cbuf_index].U32, zero, Const(word))};
+            return OpLoad(U32[1], pointer);
+        }
+        if (Sirit::ValidId(uniform_types.U32x4) && Sirit::ValidId(cbufs[cbuf_index].U32x4)) {
+            const Id pointer{OpAccessChain(uniform_types.U32x4, cbufs[cbuf_index].U32x4, zero, Const(word / 4))};
+            return OpCompositeExtract(U32[1], OpLoad(U32[4], pointer), word % 4);
+        }
+        return ConstantNull(U32[1]);
+    }};
+    const auto cbuf_u32x2{[&](u32 cbuf_index, u32 byte_offset) -> Id {
+        if (Sirit::ValidId(uniform_types.U32x2) && Sirit::ValidId(cbufs[cbuf_index].U32x2)) {
+            const Id pointer{OpAccessChain(uniform_types.U32x2, cbufs[cbuf_index].U32x2, zero,
+                                           Const(byte_offset / 8))};
+            return OpLoad(U32[2], pointer);
+        }
+        const u32 word{byte_offset / 4};
+        return OpCompositeConstruct(U32[2], cbuf_u32(cbuf_index, word), cbuf_u32(cbuf_index, word + 1));
+    }};
     // (EvilOOT) the structure pointer type of a storage buffer of that member's elements, for OpArrayLength
     const auto struct_pointer_of{[&](DefPtr m) -> Id {
         if (m == &StorageDefinitions::U32) return storage_types.U32.array;
@@ -1229,13 +1256,12 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
             for (size_t index = 0; index < num_buffers; ++index) {
                 const auto& ssbo{info.storage_buffers_descriptors[index]};
                 if (index == miss_index || ssbo.count != 1 || ssbo.cbuf_index == 0 || ssbo.cbuf_offset % 8 != 0 ||
-                    !Sirit::ValidId(ssbos[index].*ssbo_member) || !Sirit::ValidId(cbufs[ssbo.cbuf_index].U32x2)) {
+                    !Sirit::ValidId(ssbos[index].*ssbo_member) || !cbuf_has_words(ssbo.cbuf_index)) {
                     continue;
                 }
                 candidate[index] = true;
-                const Id words_pointer{OpAccessChain(uniform_types.U32x2, cbufs[ssbo.cbuf_index].U32x2, zero,
-                                                     Const(ssbo.cbuf_offset / 8))};
-                bases[index] = OpBitwiseAnd(U64, OpBitcast(U64, OpLoad(U32[2], words_pointer)), Constant(U64, align_mask));
+                bases[index] = OpBitwiseAnd(U64, OpBitcast(U64, cbuf_u32x2(ssbo.cbuf_index, ssbo.cbuf_offset)),
+                                            Constant(U64, align_mask));
                 const Id elements{OpArrayLength(U32[1], ssbos[index].*ssbo_member, 0U)};
                 const Id bound_end{
                     OpIAdd(U64, bases[index], OpUConvert(U64, OpShiftLeftLogical(U32[1], elements, Const(shift))))};
@@ -1273,17 +1299,13 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
                 continue;
             }
             const auto& ssbo{info.storage_buffers_descriptors[index]};
-            const Id ssbo_addr_cbuf_offset{Const(ssbo.cbuf_offset / 8)};
-            const Id ssbo_size_cbuf_offset{Const(ssbo.cbuf_offset / 4 + 2)};
-            const Id ssbo_addr_pointer{OpAccessChain(
-                uniform_types.U32x2, cbufs[ssbo.cbuf_index].U32x2, zero, ssbo_addr_cbuf_offset)};
-            const Id ssbo_size_pointer{OpAccessChain(uniform_types.U32, cbufs[ssbo.cbuf_index].U32,
-                                                     zero, ssbo_size_cbuf_offset)};
-
+            if (!Sirit::ValidId(element_pointer) || !Sirit::ValidId(ssbos[index].*ssbo_member)) {
+                continue;
+            }
             const u64 ssbo_align_mask{~(profile.min_ssbo_alignment - 1U)};
-            const Id unaligned_addr{OpBitcast(U64, OpLoad(U32[2], ssbo_addr_pointer))};
+            const Id unaligned_addr{OpBitcast(U64, cbuf_u32x2(ssbo.cbuf_index, ssbo.cbuf_offset))};
             const Id ssbo_addr{OpBitwiseAnd(U64, unaligned_addr, Constant(U64, ssbo_align_mask))};
-            const Id ssbo_size{OpUConvert(U64, OpLoad(U32[1], ssbo_size_pointer))};
+            const Id ssbo_size{OpUConvert(U64, cbuf_u32(ssbo.cbuf_index, ssbo.cbuf_offset / 4 + 2))};
             Id ssbo_end{OpIAdd(U64, unaligned_addr, ssbo_size)};
             // (EvilOOT) no further than what is bound: a buffer the back end could not bind is a null descriptor (length 0), and an
             // address in its range read 0 through it instead of going on to the page table (OoT's ambient light probes: 0, the
@@ -1309,7 +1331,7 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
         }
         for (const GlobalTableVars& table : ssbo_tables) {   // (hookshot: Info::global_tables)
             const Id table_id{table.vars.*ssbo_member};
-            if (!Sirit::ValidId(table_id) || !Sirit::ValidId(cbufs[table.cbuf_index].U32x2)) {
+            if (!Sirit::ValidId(table_id) || !Sirit::ValidId(element_pointer) || !cbuf_has_words(table.cbuf_index)) {
                 continue;
             }
             if (Sirit::ValidId(table_counter)) {
@@ -1366,14 +1388,12 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
             }
             for (u32 k = 0; k < table.count; ++k) {
                 const u32 at{table.cbuf_offset + k * 16};
-                const Id entry_pointer{OpAccessChain(uniform_types.U32x2, cbufs[table.cbuf_index].U32x2, zero,
-                                                     Const(at / 8))};
-                const Id size_pointer{OpAccessChain(uniform_types.U32x2, cbufs[table.cbuf_index].U32x2, zero,
-                                                    Const(at / 8 + 1))};
+                const Id entry_words{cbuf_u32x2(table.cbuf_index, at)};
+                const Id size_words{cbuf_u32x2(table.cbuf_index, at + 8)};
                 const u64 ssbo_align_mask{~(profile.min_ssbo_alignment - 1U)};
-                const Id unaligned_addr{OpBitcast(U64, OpLoad(U32[2], entry_pointer))};
+                const Id unaligned_addr{OpBitcast(U64, entry_words)};
                 const Id ssbo_addr{OpBitwiseAnd(U64, unaligned_addr, Constant(U64, ssbo_align_mask))};
-                const Id size_word{OpCompositeExtract(U32[1], OpLoad(U32[2], size_pointer), 0U)};
+                const Id size_word{OpCompositeExtract(U32[1], size_words, 0U)};
                 Id ssbo_end{OpIAdd(U64, unaligned_addr, OpUConvert(U64, size_word))};
                 // (EvilOOT) an entry without a size (OoT's culling setup keeps bare pointers, the size word 0: the back end
                 // binds those up to 1 MB of their pool, vk_draw.cpp): the binding's own length is the end
@@ -1455,10 +1475,47 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
         }};
     std::tie(load_global_func_u32, write_global_func_u32) =
         define(&StorageDefinitions::U32, storage_types.U32, U32[1], sizeof(u32));
+    // (hookshot) without aliasing there is no U32x2 or U32x4 storage view. A 64- or 128-bit global access is that many
+    // 32-bit ones, the same way the storage-buffer loads are.
+    const auto define_wide_from_u32{[&](Id type, u32 words) {
+        const Id load_type{TypeFunction(type, U64)};
+        const Id load{OpFunction(type, spv::FunctionControlMask::DontInline, load_type)};
+        const Id addr{OpFunctionParameter(U64)};
+        AddLabel();
+        Id parts[4]{};
+        for (u32 i = 0; i < words; ++i) {
+            const Id at{i == 0 ? addr : OpIAdd(U64, addr, Constant(U64, static_cast<u64>(i) * 4))};
+            parts[i] = OpFunctionCall(U32[1], load_global_func_u32, at);
+        }
+        if (words == 2) {
+            OpReturnValue(OpCompositeConstruct(type, parts[0], parts[1]));
+        } else {
+            OpReturnValue(OpCompositeConstruct(type, parts[0], parts[1], parts[2], parts[3]));
+        }
+        OpFunctionEnd();
+        const Id store_type{TypeFunction(void_id, U64, type)};
+        const Id store{OpFunction(void_id, spv::FunctionControlMask::DontInline, store_type)};
+        const Id store_addr{OpFunctionParameter(U64)};
+        const Id data{OpFunctionParameter(type)};
+        AddLabel();
+        for (u32 i = 0; i < words; ++i) {
+            const Id at{i == 0 ? store_addr : OpIAdd(U64, store_addr, Constant(U64, static_cast<u64>(i) * 4))};
+            OpFunctionCall(void_id, write_global_func_u32, at, OpCompositeExtract(U32[1], data, i));
+        }
+        OpReturn();
+        OpFunctionEnd();
+        return std::make_pair(load, store);
+    }};
+    const auto wide_or_defined{[&](DefPtr member, const StorageTypeDefinition& type_def, Id type, u32 words) {
+        if (Sirit::ValidId(type_def.element)) {
+            return define(member, type_def, type, words * sizeof(u32));
+        }
+        return define_wide_from_u32(type, words);
+    }};
     std::tie(load_global_func_u32x2, write_global_func_u32x2) =
-        define(&StorageDefinitions::U32x2, storage_types.U32x2, U32[2], sizeof(u32[2]));
+        wide_or_defined(&StorageDefinitions::U32x2, storage_types.U32x2, U32[2], 2);
     std::tie(load_global_func_u32x4, write_global_func_u32x4) =
-        define(&StorageDefinitions::U32x4, storage_types.U32x4, U32[4], sizeof(u32[4]));
+        wide_or_defined(&StorageDefinitions::U32x4, storage_types.U32x4, U32[4], 4);
     // (hookshot) the 32-bit atomics' fallbacks, as the loads': the old value, 0 where no buffer holds the address
     using Atomic = Id (Sirit::Module::*)(Id, Id, Id, Id, Id);
     static constexpr std::array<Atomic, 9> atomics{

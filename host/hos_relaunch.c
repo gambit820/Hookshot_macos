@@ -67,6 +67,40 @@ static void relaunch(void) {
     free(cmd);
     free(env);
 }
+#elif defined(__APPLE__)
+#include <crt_externs.h>
+#include <dirent.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <mach-o/dyld.h>
+#include <unistd.h>
+
+static void relaunch(void) {
+    char exe[PATH_MAX], resolved[PATH_MAX];
+    uint32_t cap = sizeof exe;
+    if (_NSGetExecutablePath(exe, &cap) != 0) {
+        hos_log("restart: this executable's path was not found: the game only exits");
+        hos_log_flush();
+        return;
+    }
+    const char *path = realpath(exe, resolved) ? resolved : exe;
+    char **argv = *_NSGetArgv();
+    char **envp = *_NSGetEnviron();
+    /* (the macOS SDK has no closefrom: mark the open descriptors so execve drops them, and leave the log open if it fails) */
+    DIR *d = opendir("/dev/fd");
+    if (d) {
+        const int skip = dirfd(d);
+        for (struct dirent *e; (e = readdir(d));) {
+            const int fd = atoi(e->d_name);
+            if (fd > 2 && fd != skip) fcntl(fd, F_SETFD, fcntl(fd, F_GETFD) | FD_CLOEXEC);
+        }
+        closedir(d);
+    }
+    fflush(NULL);
+    execve(path, argv, envp);
+    hos_log("restart: the game could not be started again: it only exits");
+    hos_log_flush();
+}
 #else
 #include <dirent.h>
 #include <fcntl.h>

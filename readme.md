@@ -64,6 +64,7 @@ the table says what works and what does not yet.
 | Intel cards | ❓ Few reports, many of them black screens or crashes ([#17](https://github.com/NotRexed/Hookshot/issues/17)) |
 | Cards without mesh shaders (such as AMD RX 5000 and older) | ❌ Not supported: parts of the picture are missing. Since v2.0.6 a fallback runs the mesh programs as compute shaders on cards with buffer device addresses ([#640](https://github.com/NotRexed/Hookshot/issues/640)); it leaves out the mesh draws that take their count from a buffer |
 | Linux | ✅ Works with the AppImage. Tested on several distributions (CachyOS, Fedora, Bazzite, SteamOS) and cards, with open problems on some AMD cards ([#604](https://github.com/NotRexed/Hookshot/issues/604), [#528](https://github.com/NotRexed/Hookshot/issues/528)) |
+| macOS | ⚠️ Apple Silicon, through MoltenVK. The opening and the menus run on an M5 with 16 GB. The picture can be wrong in places. A Mac with 18 GB of memory or less uses a smaller memory pool so the game still fits |
 
 ## Install and play
 
@@ -74,12 +75,13 @@ you start the game from its launcher, which also updates it.
 
 - **Your copy of the game at the supported version:** program `0400486024DEC000`, update v131072, build `e0f3ccfa`.
   Other versions do not work. A `.nup` file, or the `romfs` and `exefs` folders.
-- 64-bit Windows 10 or 11, or 64-bit Linux with glibc 2.35 or newer (Ubuntu 22.04, Debian 12, Fedora, Arch,
-  SteamOS ...) and a CPU with AVX2. The Linux AppImage needs AVX2; on Windows, and in a build from source, a CPU
-  without it gets a game built for what it has, a little slower.
+- 64-bit Windows 10 or 11, 64-bit Linux with glibc 2.35 or newer (Ubuntu 22.04, Debian 12, Fedora, Arch,
+  SteamOS ...) and a CPU with AVX2, or an Apple Silicon Mac. The Linux AppImage needs AVX2; on Windows, and in a build
+  from source, a CPU without it gets a game built for what it has, a little slower. The Mac build uses the Mac's own
+  compiler.
 - A graphics card with Vulkan 1.3 and mesh shaders, with an up-to-date driver: NVIDIA GeForce RTX 20 series or newer,
-  AMD Radeon RX 6000 series or newer, or Intel Arc. On Linux, Mesa or NVIDIA's driver. Cards without mesh shaders are
-  not supported.
+  AMD Radeon RX 6000 series or newer, or Intel Arc. On Linux, Mesa or NVIDIA's driver. On Mac, MoltenVK: it has no mesh
+  shaders, so those draws run as compute. Cards without mesh shaders are not supported on Windows and Linux.
 - 8 GB of video memory (VRAM) or more is recommended. Cards with less can use the in-game menu's lower Quality presets.
 - 16 GB of RAM or more. A run uses about 10 GB.
 - About 60 GB free while building, on an SSD if you can: a hard drive makes the build much slower. You can build on one
@@ -145,6 +147,38 @@ Reload with `sudo udevadm control --reload-rules` and apply with
 `sudo udevadm trigger --action=add /sys/class/misc/udmabuf`; restart the session/service after a group change.
 If the device is absent, the distribution must provide/load the module first (`sudo modprobe udmabuf`).
 Do not run the game as root or make the device world-writable.
+
+### On macOS
+
+This is a build from this repository. The Windows and Linux downloads above do not run on a Mac.
+
+1. Install Xcode's command line tools, then Homebrew's packages:
+
+   ```sh
+   xcode-select --install
+   brew install python molten-vk vulkan-headers vulkan-loader sdl2 ffmpeg pkg-config
+   ```
+
+2. Double-click `builder/macos/Hookshot.app`. The first time, right-click it and choose **Open**.
+3. Press **Browse** and choose your `.nup`. You can also drop the `.nup` on the Hookshot icon.
+4. Under **Save the game to**, keep `~/Games/Hookshot` or choose another folder. Choose a **Language**.
+5. Press **Build**. It takes about as long as the Windows and Linux builds.
+6. When it says **Your game is ready**, press **Play**.
+
+Play finds MoltenVK from Homebrew. On a Mac with 18 GB of memory or less it asks the game for 9400 MB, which still
+holds the game's own pool. A larger Mac keeps the game's usual amount.
+
+The build also writes `Hookshot.app` into the game folder. That one only starts the game built there. The first start
+prepares shaders and can sit on a black window for a while.
+
+To hand the builder to someone else, without your game:
+
+```sh
+python -I builder/macos/hookshot_builder.py --package dist/Hookshot-mac
+```
+
+That writes `dist/Hookshot-mac.zip`. It has no `.nup`, no `image.bin`, and no built game. Each person points the
+builder at their own `.nup`. Do not send the game folder.
 
 ### Updating
 
@@ -624,6 +658,36 @@ the AppImage from them. A folder built from a source checkout has no launcher: `
 </details>
 
 <details>
+<summary>macOS, from the command line</summary>
+
+You need Xcode's command line tools, Homebrew's `python`, `molten-vk`, `vulkan-headers`, `vulkan-loader`, `sdl2`,
+`ffmpeg` and `pkg-config`, and `pip install -r requirements.txt` in a Python 3.11 or newer. Vulkan and SPIR-V headers
+come from Homebrew. The Vulkan Memory Allocator header is not: set `HOOKSHOT_VMA_HEADERS` to a folder whose
+`include/vk_mem_alloc.h` is that header (a checkout that already built once has it at `work/vma`).
+
+```sh
+python -I nx2/make_game.py --nup ~/your-game.nup --out ~/Games/Hookshot --language en-US
+```
+
+`builder/macos/Hookshot.app` is the same build with a window: **Browse** chooses the `.nup`. To share that builder,
+`python -I builder/macos/hookshot_builder.py --package dist/Hookshot-mac`.
+
+The game in `~/Games/Hookshot` does not find Homebrew's libraries on its own. The builder's **Play** sets them. From
+a terminal:
+
+```sh
+cd ~/Games/Hookshot
+export DYLD_LIBRARY_PATH="$(brew --prefix)/lib"
+export VK_DRIVER_FILES="$(brew --prefix)/etc/vulkan/icd.d/MoltenVK_icd.json"
+export MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS=1
+./hookshot
+```
+
+On a Mac with 18 GB of memory or less, also `export HOS_MEMORY_MB=9400`.
+
+</details>
+
+<details>
 <summary>The Windows game, built on Linux</summary>
 
 Unpack llvm-mingw's Linux build (`ucrt-ubuntu-22.04-x86_64`), then run `make_game.py` with `RX_TARGET=windows` and
@@ -635,9 +699,9 @@ The game folder runs under Proton or on Windows.
 ### Running the game from the command line
 
 The built game is `bin\hookshot.exe` on Windows and `bin/hookshot` in a packaged Linux game folder. A build from a
-source checkout has `hookshot.exe` or `hookshot` in its build folder, with no launcher beside it. The `hookshot.exe`
-or `hookshot` launcher in the game folder does not pass these arguments to the game, so start the game directly to
-use them.
+source checkout, including the Mac build, has `hookshot.exe` or `hookshot` in its build folder, with no launcher beside
+it. The `hookshot.exe` or `hookshot` launcher in the game folder does not pass these arguments to the game, so start
+the game directly to use them.
 
 | Argument | What it does |
 |---|---|

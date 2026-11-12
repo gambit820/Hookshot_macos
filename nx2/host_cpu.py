@@ -1,7 +1,8 @@
 """The x86-64 level this PC's CPU runs (nx2/build.py's -march; issue 363). The game is built on the PC it runs on, so a
 CPU without x86-64-v3's features (AVX2, FMA, BMI2, MOVBE) gets x86-64-v2, or the x86-64 baseline. RX_MARCH, read by
-build.py, still chooses."""
+build.py, still chooses. An Apple Silicon Mac has no x86 march: "" means the compiler's own target."""
 import os
+import platform
 
 
 def host_march():
@@ -20,6 +21,10 @@ def host_march():
         if all(f in flags for f in want):
             return "x86-64-v3"
         return "x86-64-v2" if all(f in flags for f in ("sse4_2", "popcnt", "ssse3")) else "x86-64"
+    except FileNotFoundError:
+        if platform.machine().lower() in ("arm64", "aarch64"):
+            return ""
+        return "x86-64-v3"
     except Exception:
         return "x86-64-v3"
 

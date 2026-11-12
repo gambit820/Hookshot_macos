@@ -226,8 +226,9 @@ def main():
         raise SystemExit("the precompile leaves the mesh fallback's compute pipelines to play")
     shader = _with_cache(ROOT / "gpu" / "vk" / "vk_shader.cpp")
     if "(fallbacks && (it->second[0].kind & 4))" not in block(shader, "size_t program_cache_load_some(") or \
-            "}, all_computes, true);" not in precompile:
-        raise SystemExit("the precompile loads only the mesh fallback programs play has drawn (white until compiled)")
+            "}, all_computes, precompile_fallbacks);" not in precompile or \
+            "VK_DRIVER_ID_MOLTENVK" not in precompile or "precompile_fallbacks = false" not in precompile:
+        raise SystemExit("the precompile no longer loads every mesh fallback, except the 16 GB MoltenVK defer")
     print("mesh shader fallback (compute records and a vertex stage) ok")
 
 

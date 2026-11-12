@@ -1,0 +1,24 @@
+#!/bin/bash
+# Opens the builder. In this checkout the script sits beside the app; in a shared folder it sits under source/.
+set -eu
+HERE="$(cd "$(dirname "$0")" && pwd)"
+if [ -f "$HERE/../../hookshot_builder.py" ]; then
+    SCRIPT="$HERE/../../hookshot_builder.py"
+elif [ -f "$HERE/../../../source/builder/macos/hookshot_builder.py" ]; then
+    SCRIPT="$HERE/../../../source/builder/macos/hookshot_builder.py"
+else
+    osascript -e 'display alert "Hookshot" message "The builder files were not found next to this app."' || true
+    exit 1
+fi
+PY=""
+for cand in /usr/bin/python3 /opt/homebrew/bin/python3 /usr/local/bin/python3; do
+    if [ -x "$cand" ] && "$cand" -c 'import tkinter' >/dev/null 2>&1; then
+        PY="$cand"
+        break
+    fi
+done
+if [ -z "$PY" ]; then
+    osascript -e 'display alert "Hookshot" message "Python with Tk was not found. macOS Python at /usr/bin/python3 has it."' || true
+    exit 1
+fi
+exec "$PY" -I "$SCRIPT" "$@"

@@ -1,3 +1,7 @@
+#ifdef __APPLE__
+/* (macOS has no perf_event_open or /proc/self/task. Sampling stays off; the game still runs.) */
+void hos_prof_start(void) {}
+#else
 /* (linux) host/mkw_glue.c's profilers, with the same variables and the same lines in the log and files:
    HOS_PROFILE=<seconds> (the busiest threads), HOS_THREAD_TIMES=<seconds> (threads over 5% of a core), HOS_SAMPLE=<thread
    name> + HOS_SAMPLE_FILE (one thread's stacks every millisecond), HOS_SAMPLE_ALL=<path> (every guest thread and the
@@ -510,3 +514,4 @@ void hos_prof_start(void) {
     const char *watch = getenv("HOS_WATCH");
     if (watch && *watch) CreateThread(NULL, 0, watch_thread, (void *)watch, 0, NULL);
 }
+#endif

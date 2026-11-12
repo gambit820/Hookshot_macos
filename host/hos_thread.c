@@ -15,7 +15,6 @@
 #ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION   /* (older Windows SDKs lack it: Windows 10 1803 and later take it) */
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
-#include <emmintrin.h>
 #ifdef __EMSCRIPTEN__
 #include <sched.h>
 #include <stdatomic.h>
@@ -314,6 +313,20 @@ void hos_log(const char *fmt, ...) {
     if (log_queue(line)) return;
     fputs(line, stderr);
     fflush(stderr);
+#ifdef __APPLE__
+    /* The Terminal scrollback hides the present lines under the scheduler heartbeat. The same lines go to
+       hookshot_log.txt in the directory the game was started from. */
+    static FILE *saved;
+    static int tried;
+    if (!tried) {
+        tried = 1;
+        saved = fopen("hookshot_log.txt", "w");
+    }
+    if (saved) {
+        fputs(line, saved);
+        fflush(saved);
+    }
+#endif
 }
 
 void hos_fatal(Ctx *c, const char *fmt, ...) {
@@ -1083,7 +1096,7 @@ static int present_poll(Ctx *c, int64_t ns) {
     const int64_t end = hos_now_ns() + ns;
     while (v != 1 && hos_now_ns() < end) {
         SwitchToThread();
-        for (int i = 0; i < 64; i++) _mm_pause();
+        for (int i = 0; i < 64; i++) YieldProcessor();
         hos_nvn_event_value(ev, &v);
     }
     if (away) hos_vcore_back();
