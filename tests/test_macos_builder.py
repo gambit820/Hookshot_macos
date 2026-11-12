@@ -70,6 +70,23 @@ class ShareTests(unittest.TestCase):
             mac.copy_share(src, dest)
 
 
+class NativeAppTests(unittest.TestCase):
+    def test_the_mac_app_lists_the_build_languages_and_the_small_mac_pool(self):
+        sys.path.insert(0, os.path.join(ROOT, "nx2"))
+        import make_game
+        with open(os.path.join(ROOT, "builder", "macos", "Sources", "BuilderModel.swift"), encoding="utf-8") as f:
+            swift = f.read()
+        for code, name in make_game.LANGUAGES:
+            self.assertIn('"%s"' % code, swift)
+            self.assertIn('"%s"' % name, swift)
+        self.assertIn('appleMemoryMB = "9400"', swift)
+        self.assertIn("18 * 1024 * 1024 * 1024", swift)
+        self.assertIn("make_game.py", swift)
+        self.assertIn('"--nup"', swift)
+        self.assertIn("MoltenVK_icd.json", swift)
+        self.assertIn("MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS", swift)
+
+
 class LauncherTests(unittest.TestCase):
     def test_the_game_app_points_at_the_built_game(self):
         text = mac.game_launcher_script("./hookshot", {"VK_DRIVER_FILES": "/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json",

@@ -13,7 +13,7 @@ What you need
 
 Build and play
 
-1. Double-click Hookshot.app.
+1. Double-click Hookshot.app. The window is a Mac app. The first time, right-click it and choose Open.
 2. Press Browse and choose your .nup. You can also drop the .nup onto the Hookshot icon.
 3. Leave the folder as ~/Games/Hookshot, or choose another.
 4. Press Build. The first build takes a long time. The .nup is only read; it is not changed.
@@ -22,5 +22,7 @@ Build and play
 The next time, double-click Hookshot.app and press Play, or double-click Hookshot.app inside the game folder. That second app only starts the game that was built on this Mac.
 
 The first start prepares shaders and can sit on a black window for a while. Later starts are faster.
+
+On this build the picture can be wrong in places, and moving through the menus can crash the game. Both are still open.
 
 Saves are in the game folder's user directory and in ~/.local/share/hookshot. They stay on this Mac.
