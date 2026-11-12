@@ -30,6 +30,10 @@ static_assert(mkwvk::kQueueGraphics == VK_QUEUE_GRAPHICS_BIT && mkwvk::kQueueCom
 #ifndef HOOKSHOT_ENV_H   // (env_on: the switches' one rule)
 #include "hookshot_env.h"
 #endif
+#ifdef __APPLE__
+#include <dispatch/dispatch.h>
+#include <pthread.h>
+#endif
 
 namespace vkx {
 #define VKX_DEFINE(f) PFN_##f f;
@@ -43,6 +47,12 @@ VKX_DEVICE3(VKX_DEFINE)
 static PFN_vkGetInstanceProcAddr get_instance_proc;
 
 bool load_global() {
+#ifdef __APPLE__
+    // (MoltenVK rejects the aliased descriptor arrays these shaders use unless they are Metal argument buffers.
+    // Set before the loader opens libMoltenVK, which reads this when it is loaded. An explicit value is left as it is.)
+    if (!getenv("MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS"))
+        setenv("MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS", "1", 0);
+#endif
 #ifdef _WIN32   // (hookshot: the loader from System32 only, not from the current folder or PATH)
     HMODULE m = LoadLibraryExA("vulkan-1.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
 #else
@@ -137,8 +147,8 @@ bool create_instance() {
         vkEnumerateInstanceExtensionProperties(nullptr, &n, nullptr);
         std::vector<VkExtensionProperties> all(n);
         vkEnumerateInstanceExtensionProperties(nullptr, &n, all.data());
-        for (const char* want : {"VK_KHR_xlib_surface", "VK_KHR_xcb_surface", "VK_KHR_wayland_surface"})
-            if (has_extension(all, want)) exts[n_exts++] = want;
+        for (const char* want : {"VK_KHR_xlib_surface", "VK_KHR_xcb_surface", "VK_KHR_wayland_surface", "VK_EXT_metal_surface"})
+            if (has_extension(all, want) && n_exts < 4) exts[n_exts++] = want;
     }
 #endif
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
@@ -157,6 +167,13 @@ bool create_instance() {
         // whenever the driver has it; the SDR choice in create_swapchain keeps to the sRGB surface)
         if (has_extension(all, VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME))
             ext_list.push_back(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME), dev.swapchain_colorspace = true;
+#ifdef __APPLE__
+        // (MoltenVK is a portability driver: without this bit the loader reports no GPU)
+        if (has_extension(all, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME)) {
+            ext_list.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+            ci.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+        }
+#endif
     }
     ci.enabledExtensionCount = (uint32_t)ext_list.size();
     ci.ppEnabledExtensionNames = ext_list.data();
@@ -247,6 +264,10 @@ bool create_device() {
     std::vector<VkExtensionProperties> exts(n);
     vkEnumerateDeviceExtensionProperties(dev.physical, nullptr, &n, exts.data());
     std::vector<const char*> want = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
+#ifdef __APPLE__
+    if (has_extension(exts, "VK_KHR_portability_subset"))
+        want.push_back("VK_KHR_portability_subset");   // (MoltenVK requires this when it offers it; the name is beta-gated in the headers)
+#endif
     auto optional = [&](const char* name, bool& flag) {
         flag = has_extension(exts, name);
         if (flag) want.push_back(name);
@@ -459,8 +480,11 @@ bool create_device() {
         }
         return v != 1;   // (Auto and On: on)
     }();
-    const bool robust_ok = robust && robust2.robustBufferAccess2 && f.features.robustBufferAccess;
-    robust2.robustBufferAccess2 = robust_ok ? VK_TRUE : VK_FALSE;
+    // The sized check (robustBufferAccess2) is a separate feature. MoltenVK advertises the original one and not that.
+    // Turning the original one on there still went wrong: the first frames never appeared, and a live allocator block
+    // had its address cleared. Left off on that driver. RX_VK_ROBUST=1 forces it.
+    bool robust_ok = robust && f.features.robustBufferAccess;
+    robust2.robustBufferAccess2 = robust_ok && robust2.robustBufferAccess2 ? VK_TRUE : VK_FALSE;
     robust2.robustImageAccess2 = VK_FALSE;
     dev.null_descriptor = dev.null_descriptor && robust2.nullDescriptor;
     pv.transformFeedbackPreservesProvokingVertex = VK_FALSE;
@@ -517,6 +541,8 @@ bool create_device() {
         // (RADV on GCN 1-4, GFX6-8: no 16-bit shader inputs and outputs there, which RADV has from GFX9 (packed 16-bit math) on.
         // Its compiler cannot build the biggest mesh fallback programs: fallback_size_policy.h)
         dev.radv_gcn = drv.driverID == VK_DRIVER_ID_MESA_RADV && !f11.storageInputOutput16;
+        if (dev.driver_id == VK_DRIVER_ID_MOLTENVK && !(getenv("RX_VK_ROBUST") && atoi(getenv("RX_VK_ROBUST"))))
+            robust_ok = false;
         logf("vk: subgroups: default %u lanes, %u-%u, pinned to 32 on stages %#x; RADV on GCN 1-4: %s", sg.subgroupSize, sc.minSubgroupSize,
              sc.maxSubgroupSize, (unsigned)dev.sg32_stages, dev.radv_gcn ? "yes" : "no");
     }
@@ -790,6 +816,12 @@ bool create_swapchain(uint32_t width, uint32_t height) {
     ci.imageColorSpace = fmt.colorSpace;
     ci.imageExtent = {width, height};
     ci.imageArrayLayers = 1;
+#ifdef __APPLE__
+    // The drawable is the swapchain image. Asking for transfer usage makes MoltenVK keep a private
+    // texture and drop the copy onto the layer, so the window stays black. The picture is sampled
+    // into the drawable instead (copy_swapchain).
+    ci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+#else
     ci.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     // The renderer copies into swapchain images. Readback is optional and only available on surfaces that allow it.
     if (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)
@@ -797,6 +829,7 @@ bool create_swapchain(uint32_t width, uint32_t height) {
     // (hookshot) the overlays Dear ImGui draws (vk_imgui.cpp) render into it. Every surface allows it (the Vulkan spec)
     if (caps.supportedUsageFlags & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)
         ci.imageUsage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+#endif
     ci.preTransform = caps.currentTransform;
     ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
     if (!(caps.supportedCompositeAlpha & ci.compositeAlpha)) {
@@ -821,7 +854,11 @@ bool create_swapchain(uint32_t width, uint32_t height) {
         ci.queueFamilyIndexCount = sharing_n;
         ci.pQueueFamilyIndices = sharing;
     }
+#ifdef __APPLE__
+    ci.clipped = VK_FALSE;   // (an occluded window would otherwise be allowed to keep a blank drawable)
+#else
     ci.clipped = VK_TRUE;
+#endif
     ci.oldSwapchain = dev.swapchain;
     // (hookshot) an sRGB swapchain (some drivers list no UNORM format) made mutable when the driver can: the overlays draw
     // through UNORM views, their colours as they are, as on a UNORM swapchain. Without it, vk_imgui.cpp makes them linear
@@ -1331,6 +1368,29 @@ bool open_window_surface(bool log_failure) {
     return true;
 }
 
+#ifdef __APPLE__
+struct AppleSurfaceJob {
+    const MkwVkWindow* w;
+    int ok;
+};
+void apple_surface_on_main(void* ctx) {
+    auto* j = static_cast<AppleSurfaceJob*>(ctx);
+    j->ok = 0;
+    if (!open_window_surface(true)) return;
+    int width = 0, height = 0;
+    j->w->drawable_size(j->w->window, &width, &height);
+    if (width <= 0 || height <= 0) {
+        logf("vk: SDL returned zero drawable size %dx%d", width, height);
+        return;
+    }
+    if (!create_swapchain((uint32_t)width, (uint32_t)height)) {
+        logf("vk: swapchain creation failed for drawable %dx%d", width, height);
+        return;
+    }
+    j->ok = 1;
+}
+#endif
+
 int start(void* hwnd) {
     main_window = (HWND)hwnd;
     if (!hwnd) {   // (HOS_HEADLESS: no window; the frames are rendered all the same, RX_VK_SHOTS writes them out)
@@ -1354,6 +1414,14 @@ int start(void* hwnd) {
         logf("vk: unsupported SDL window bridge version %u (expected %u)", w->version, MKWVK_WINDOW_VERSION);
         return 0;
     }
+#ifdef __APPLE__
+    // SDL's Metal layer is only attached when the surface is made on the main thread. From the renderer thread the
+    // swapchain presents successfully and the window stays black.
+    AppleSurfaceJob job{w, 0};
+    if (pthread_main_np()) apple_surface_on_main(&job);
+    else dispatch_sync_f(dispatch_get_main_queue(), &job, apple_surface_on_main);
+    if (!job.ok) return 0;
+#else
     if (!open_window_surface(true)) return 0;
     int width = 0, height = 0;
     w->drawable_size(w->window, &width, &height);
@@ -1365,6 +1433,7 @@ int start(void* hwnd) {
         logf("vk: swapchain creation failed for drawable %dx%d", width, height);
         return 0;
     }
+#endif
 #endif
     if (!started_up()) {
         logf("vk: renderer startup failed after window and swapchain initialization");

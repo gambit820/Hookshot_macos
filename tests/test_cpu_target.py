@@ -71,6 +71,16 @@ class HostMarch(unittest.TestCase):
         with mock.patch.dict(os.environ, {"RX_STEAMDECK": "1"}, clear=True):
             self.assertEqual(host_cpu.host_mtune(), "znver2")
 
+    def test_missing_cpuinfo_on_arm64_is_native(self):
+        def boom(path, *args, **kwargs):
+            if path == "/proc/cpuinfo":
+                raise FileNotFoundError(path)
+            raise AssertionError(path)
+        with mock.patch.object(host_cpu.os, "name", "posix"), \
+                mock.patch.object(host_cpu.platform, "machine", return_value="arm64"), \
+                mock.patch.object(builtins, "open", boom):
+            self.assertEqual(host_cpu.host_march(), "")
+
     def test_windows(self):
         class K32:
             def __init__(self, present):

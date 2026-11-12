@@ -19,6 +19,9 @@
 #if defined(__linux__)
 #include <malloc.h>
 #endif
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#endif
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -410,7 +413,25 @@ struct Arena {
     std::chrono::steady_clock::time_point used_at;   // (when it last staged something)
 };
 std::vector<Arena> arenas;
-constexpr uint64_t kArena = 64ull << 20;
+// (hookshot) 64 MB on a discrete GPU. On a Mac with 16 GB of unified memory a command buffer that uploads through an
+// arena keeps a private copy of the whole buffer until that recording's slot comes round again: 48 of them are 3 GB,
+// and the intro loses the device. 8 MB there (RX_VK_ARENA_MB chooses). An upload larger than the arena is given its own.
+uint64_t staging_arena_bytes() {
+    static const uint64_t n = [] {
+        if (const char* e = getenv("RX_VK_ARENA_MB")) {
+            const int v = atoi(e);
+            if (v > 0) return (uint64_t)v << 20;
+        }
+#ifdef __APPLE__
+        uint64_t mem = 0;
+        size_t len = sizeof mem;
+        if (sysctlbyname("hw.memsize", &mem, &len, nullptr, 0) == 0 && mem <= (18ull << 30)) return 8ull << 20;
+#endif
+        return 64ull << 20;
+    }();
+    return n;
+}
+const uint64_t kArena = staging_arena_bytes();
 
 struct Staging {
     VkBuffer buffer = VK_NULL_HANDLE;

@@ -38,7 +38,24 @@ const char *hos_version(void) { return HOOKSHOT_VERSION; }   /* (discord_rpc.c's
 #include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
+#ifndef __APPLE__
 #include <sys/syscall.h>
+#endif
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#ifndef MAP_NORESERVE
+#define MAP_NORESERVE 0
+#endif
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE MAP_FIXED
+#endif
+#ifndef MADV_NOHUGEPAGE
+#define MADV_NOHUGEPAGE MADV_NORMAL
+#endif
+#ifndef MADV_REMOVE
+#define MADV_REMOVE MADV_FREE
+#endif
+#endif
 #endif
 /* (linux) the separator of the paths the executable's folder is joined with */
 #ifdef _WIN32
@@ -190,6 +207,7 @@ static int reserve_guest(void) {
                 hos_log("mem: guest memory stays host-pointer imports for the GPU (slow submissions on AMD): %s",
                         u < 0 ? "/dev/udmabuf cannot be opened" : "udmabuf's size_limit_mb cannot be read");
         }
+#ifdef __linux__
         if (e ? atoi(e) != 0 : usable) {
             const int fd = (int)syscall(SYS_memfd_create, "hookshot-guest", 1u /* MFD_CLOEXEC */ | 2u /* MFD_ALLOW_SEALING */);
             if (fd >= 0 && ftruncate(fd, (off_t)GUEST_SPACE) == 0) {
@@ -206,6 +224,7 @@ static int reserve_guest(void) {
             if (fd >= 0) close(fd);
             hos_log("mem: no memfd for the guest window (errno %d): anonymous memory", errno);
         }
+#endif
     }
     if (mmap((void *)A64_HOST_BASE, GUEST_SPACE, PROT_READ | PROT_WRITE,
              MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE | MAP_NORESERVE, -1, 0) != (void *)A64_HOST_BASE)
@@ -229,7 +248,11 @@ static int reserve_guest(void) {
 int hos_guest_memfd = -1;
 int hos_posix_guest_memfd(void) { return hos_guest_memfd; }
 int hos_posix_guest_discard(void *p, size_t n) {
+#ifdef __APPLE__
+    return madvise(p, n, MADV_FREE);
+#else
     return madvise(p, n, hos_guest_memfd >= 0 ? MADV_REMOVE : MADV_DONTNEED);
+#endif
 }
 #endif
 
@@ -1539,6 +1562,14 @@ static void memory_notice(void) {
     struct sysinfo si;
     if (sysinfo(&si)) return;
     ram = ((unsigned long long)si.totalram * si.mem_unit) >> 20, swap = ((unsigned long long)si.totalswap * si.mem_unit) >> 20;
+#elif defined(__APPLE__)
+    int64_t mem = 0;
+    size_t len = sizeof mem;
+    if (sysctlbyname("hw.memsize", &mem, &len, NULL, 0)) return;
+    ram = (unsigned long long)mem >> 20;
+    struct xsw_usage swapu;
+    len = sizeof swapu;
+    if (!sysctlbyname("vm.swapusage", &swapu, &len, NULL, 0)) swap = (unsigned long long)swapu.xsu_total >> 20;
 #else
     return;
 #endif

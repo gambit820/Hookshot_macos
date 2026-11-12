@@ -220,6 +220,7 @@ int hos_display_init(void) {
     /* (bundled SDL tries x11 before wayland. NVIDIA's X11 surface has no mailbox, and an immediate
        present then drops vblank for every output. Wayland has mailbox. SDL_VIDEODRIVER (SDL3: SDL_VIDEO_DRIVER) still wins.
        Under gamescope (XDG_CURRENT_DESKTOP names it: Steam Deck game mode) SDL keeps its own order.) */
+#ifndef __APPLE__   /* (Cocoa is the Mac driver; wayland,x11 would leave SDL with no window) */
     const char* desktop = getenv("XDG_CURRENT_DESKTOP");
     const int gamescope = desktop && strstr(desktop, "gamescope");
     if (!getenv("SDL_VIDEODRIVER") && !getenv("SDL_VIDEO_DRIVER") && !gamescope)
@@ -230,6 +231,7 @@ int hos_display_init(void) {
        (#992). libdecor takes the compositor's decorations itself where they are offered; with no libdecor SDL keeps
        its own. SDL3 waits on the window's state and is left alone; SDL_VIDEO_WAYLAND_PREFER_LIBDECOR still wins) */
     if (hos_sdl_load() == 2) hos_sdl_hint("SDL_VIDEO_WAYLAND_PREFER_LIBDECOR", "1");
+#endif
     if (!hos_sdl_init(HOS_SDL_VIDEO | HOS_SDL_EVENTS)) {
         hos_log("display: SDL_Init: %s: no window", hos_sdl_error());
         fprintf(stderr, "display: SDL_Init: %s: no window\n", hos_sdl_error());

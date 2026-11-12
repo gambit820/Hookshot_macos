@@ -12,7 +12,11 @@
 namespace mkwvk {
 namespace {
 
+#ifdef __APPLE__
+constexpr int kSlots = 8;                 // (vk_replay.cpp's kRecordings)
+#else
 constexpr int kSlots = 48;                // (vk_replay.cpp's kRecordings)
+#endif
 constexpr uint32_t kQ = 2048;             // timestamps a command buffer can take in a recording
 VkQueryPool pool = VK_NULL_HANDLE;
 struct Span {

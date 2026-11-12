@@ -85,6 +85,10 @@ A64_WEAK int a64_call_miss(Ctx *c, uint64_t target) { (void)c; (void)target; ret
 A64_WEAK void a64_ijump_hook(Ctx *c, uint64_t target) { (void)c; (void)target; }
 
 void a64_icall(Ctx *c, uint64_t target) {
+    /* A BLR through a null pointer returns 0. Leaving the previous x0 made the caller take its success path
+       (OoT's boot stores that pointer and the resource thread then walks a broken list forever). A BR to null
+       stays a plain return: the text-release trampoline is one, and its x0 is the value already computed. */
+    if (!target) c->x[0] = 0;
     A64Fn f = a64_lookup(target);
     if (!f) {
         if (a64_call_miss(c, target)) return;
@@ -178,6 +182,7 @@ static int site_profiling(void) {
    up and remembered in a free slot (only the first two targets: a site calling many would otherwise keep rewriting a
    line other threads read) */
 static void site_call(Ctx *c, uint64_t target, uint64_t *site, int call, const char *why) {
+    if (call && !target) c->x[0] = 0;   /* (same as a64_icall: a null BLR returns 0, a null BR does not) */
     if (site_prof_on && site_profiling()) {   /* (A64_SITE_PROFILE: nothing remembered, every call counted) */
         if (call) {   /* (a BR's x30 is not its site) */
             site_prof_count(c->x[30] - 4, target);

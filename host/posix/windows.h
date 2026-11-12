@@ -1,7 +1,7 @@
-/* (linux) The part of the Win32 API Hookshot's runtime and Vulkan back end use, on POSIX: host/posix is on the include
-   path of Linux builds only (nx2/build.py), so `#include <windows.h>` finds this file and the Windows code paths stay
+/* (posix) The part of the Win32 API Hookshot's runtime and Vulkan back end use, on POSIX: host/posix is on the include
+   path of Linux and macOS builds (nx2/build.py), so `#include <windows.h>` finds this file and the Windows code paths stay
    as they are. Implemented in win32_posix.c (threads, events, fibers, files, memory, modules, exceptions, waveOut) and
-   display_sdl.c (the window, keyboard, mouse).
+   display_sdl.c (the window, keyboard, mouse). macOS fills in the Linux-only pieces (futex, /proc, ucontext) beside them.
 
    Not a general emulation: what is here is what the code calls, with the behaviour it relies on. Handles are
    pointers to objects of this file's own (threads, events, timers, files, find searches); the guest window is one
@@ -98,6 +98,9 @@ typedef struct { LONG cx, cy; } SIZE;
 #define _mkdir(p) mkdir((p), 0755)
 #define _getpid getpid
 #define _countof(a) (sizeof(a) / sizeof((a)[0]))
+#ifdef __APPLE__
+extern char **environ;
+#endif
 #define _environ environ
 #define _fileno fileno
 #define _chsize_s(fd, size) ftruncate((fd), (off_t)(size))
@@ -148,7 +151,11 @@ void SetLastError(DWORD e);
 #define InterlockedCompareExchangePointer InterlockedCompareExchange
 #define MemoryBarrier() __atomic_thread_fence(__ATOMIC_SEQ_CST)
 #define _ReadWriteBarrier() __atomic_signal_fence(__ATOMIC_SEQ_CST)
+#if defined(__aarch64__) || defined(__arm64__)
+#define YieldProcessor() __asm__ __volatile__("yield")
+#else
 #define YieldProcessor() __builtin_ia32_pause()
+#endif
 
 /* ---- locks: SRW locks are POSIX rwlocks (zero-initialised is valid, as on Windows); condition variables a futex
    word, so they wait with either an SRW lock or a critical section ---- */

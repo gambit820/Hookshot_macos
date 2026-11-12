@@ -1166,7 +1166,7 @@ static void install_driver_fault_guard() {
     });
 }
 
-VkResult guarded_graphics(VkPipelineCache cache, const VkGraphicsPipelineCreateInfo* ci, VkPipeline* pl) {
+static VkResult guarded_graphics_call(VkPipelineCache cache, const VkGraphicsPipelineCreateInfo* ci, VkPipeline* pl) {
     install_driver_fault_guard();
     if (sigsetjmp(fault_jmp, 1) != 0) {
         *pl = VK_NULL_HANDLE;   // (whatever the driver wrote before it faulted is not a pipeline)
@@ -1179,7 +1179,7 @@ VkResult guarded_graphics(VkPipelineCache cache, const VkGraphicsPipelineCreateI
     fault_armed = 0;
     return r;
 }
-VkResult guarded_compute(VkPipelineCache cache, const VkComputePipelineCreateInfo* ci, VkPipeline* pl) {
+static VkResult guarded_compute_call(VkPipelineCache cache, const VkComputePipelineCreateInfo* ci, VkPipeline* pl) {
     install_driver_fault_guard();
     if (sigsetjmp(fault_jmp, 1) != 0) {
         *pl = VK_NULL_HANDLE;   // (whatever the driver wrote before it faulted is not a pipeline)
@@ -1191,6 +1191,68 @@ VkResult guarded_compute(VkPipelineCache cache, const VkComputePipelineCreateInf
     const VkResult r = vkCreateComputePipelines(dev.device, cache, 1, ci, nullptr, pl);
     fault_armed = 0;
     return r;
+}
+
+#ifdef __APPLE__
+#include <pthread.h>
+#include <sys/sysctl.h>
+// (a C++ worker on macOS is 512 KB. MoltenVK's SPIRV-Cross walks a shader's CFG by recursion, and one mesh-fallback
+// compute shader walked off that stack, 6648 frames deep, and took the process with it. Linux threads and hookshot.exe's are 8 MB,
+// which is why the same shader compiles there. A thread that already has one runs the driver call itself)
+static constexpr size_t kMoltenStack = 8u << 20;
+
+struct MoltenCall {
+    VkResult (*fn)(VkPipelineCache, const void*, VkPipeline*);
+    VkPipelineCache cache;
+    const void* ci;
+    VkPipeline* pl;
+    VkResult result;
+};
+
+static void* molten_call_main(void* p) {
+    auto* job = static_cast<MoltenCall*>(p);
+    job->result = job->fn(job->cache, job->ci, job->pl);
+    return nullptr;
+}
+
+static VkResult call_on_molten_stack(VkResult (*fn)(VkPipelineCache, const void*, VkPipeline*), VkPipelineCache cache,
+                                     const void* ci, VkPipeline* pl) {
+    if (pthread_get_stacksize_np(pthread_self()) >= kMoltenStack)
+        return fn(cache, ci, pl);
+    MoltenCall job{fn, cache, ci, pl, VK_ERROR_UNKNOWN};
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, kMoltenStack);
+    pthread_t thread{};
+    const int err = pthread_create(&thread, &attr, molten_call_main, &job);
+    pthread_attr_destroy(&attr);
+    if (err != 0)
+        return fn(cache, ci, pl);
+    pthread_join(thread, nullptr);
+    return job.result;
+}
+
+static VkResult guarded_graphics_thunk(VkPipelineCache cache, const void* ci, VkPipeline* pl) {
+    return guarded_graphics_call(cache, static_cast<const VkGraphicsPipelineCreateInfo*>(ci), pl);
+}
+static VkResult guarded_compute_thunk(VkPipelineCache cache, const void* ci, VkPipeline* pl) {
+    return guarded_compute_call(cache, static_cast<const VkComputePipelineCreateInfo*>(ci), pl);
+}
+#endif
+
+VkResult guarded_graphics(VkPipelineCache cache, const VkGraphicsPipelineCreateInfo* ci, VkPipeline* pl) {
+#ifdef __APPLE__
+    return call_on_molten_stack(guarded_graphics_thunk, cache, ci, pl);
+#else
+    return guarded_graphics_call(cache, ci, pl);
+#endif
+}
+VkResult guarded_compute(VkPipelineCache cache, const VkComputePipelineCreateInfo* ci, VkPipeline* pl) {
+#ifdef __APPLE__
+    return call_on_molten_stack(guarded_compute_thunk, cache, ci, pl);
+#else
+    return guarded_compute_call(cache, ci, pl);
+#endif
 }
 #endif
 VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at, VkPrimitiveTopology topo, int part = -1,
@@ -8081,12 +8143,28 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
     const std::unordered_set<uint64_t> used = computes_read();
     const bool all_computes = which ? !strcmp(which, "all") : used.empty();
     if (!all_computes && !(which && !strcmp(which, "none"))) wanted.insert(used.begin(), used.end());
+    // (hookshot) A Mac with 16 GB of unified memory cannot hold every mesh-fallback pipeline and the game's heap at once:
+    // MoltenVK resets the GPU a few seconds into the intro (VK_ERROR_DEVICE_LOST, the command buffer out of memory). Those
+    // pipelines are built when a draw needs them (fallback_pipelines_ready). RX_VK_PRECOMPILE_FALLBACKS=1 builds them here, =0 leaves them.
+    bool precompile_fallbacks = true;
+    if (const char* e = getenv("RX_VK_PRECOMPILE_FALLBACKS"))
+        precompile_fallbacks = atoi(e) != 0;
+#ifdef __APPLE__
+    else if (dev.driver_id == VK_DRIVER_ID_MOLTENVK) {
+        uint64_t mem = 0;
+        size_t len = sizeof mem;
+        if (sysctlbyname("hw.memsize", &mem, &len, nullptr, 0) == 0 && mem <= (18ull << 30))
+            precompile_fallbacks = false;
+    }
+#endif
+    if (!precompile_fallbacks)
+        logf("vk: precompile: mesh fallback pipelines left until a draw needs them");
     std::vector<Program*> computes, fallbacks;
     const size_t programs_n = program_cache_load_some(wanted, [&](Program& p) {
         ensure_layout(p);
         if (p.compute) computes.push_back(&p);
         else if (p.fallback) fallbacks.push_back(&p);   // (hookshot: the mesh fallback's compute pipelines too, before play)
-    }, all_computes, true);
+    }, all_computes, precompile_fallbacks);
     logf("vk: precompile: compute programs: %s (%zu keys listed as dispatched in play)",
          all_computes ? "every kept one" : (which && !strcmp(which, "none")) ? "none" : "those play dispatched", used.size());
     const double read_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();

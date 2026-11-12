@@ -42,6 +42,11 @@
 #include "vk_dlss.h"   // (hookshot: dlss_fg_idle)
 #include "vk_fps.h"
 #include "vk_menu.h"
+#include "vk_imgui.h"
+#ifdef __APPLE__
+#include <dispatch/dispatch.h>
+#include <pthread.h>
+#endif
 #include "vk_jobs.h"
 #include "vk_shader.h"
 #include "vk_state.h"
@@ -55,6 +60,8 @@
 #include "hookshot_env.h"
 #endif
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
+#include "shaders/present_copy_vert_spv.h"
+#include "shaders/present_copy_frag_spv.h"
 
 namespace mkwvk {
 extern std::atomic<bool> movie_networks_slow;   // (vk_draw.cpp: the movie networks left out, issue 109)
@@ -137,9 +144,45 @@ struct Recording {
 };
 // (24: the event waits cut a frame's command buffers into pieces, each with recordings of its own, and with 16 the
 // replay waited ~1.5 ms a frame for a slot the GPU still had)
+// (hookshot) MoltenVK keeps private transfer buffers on a command pool until the pool is destroyed (a reset leaves them).
+// 48 pools are a few GB, and a 16 GB Mac loses the device in the intro; a menu then adds another set. 8 pools, made again
+// each time the slot is reused, so only the recordings still on the GPU hold those copies.
+#ifdef __APPLE__
+constexpr int kRecordings = 8;
+#else
 constexpr int kRecordings = 48;   // (test: 24 before; with RX_VK_BATCH the ring came round to held submits once a frame)
+#endif
 Recording recordings[kRecordings];
 int recording_index = 0;
+
+#ifdef __APPLE__
+/// The slot's command pools made again. MoltenVK's private copies die with the pool; a reset keeps them.
+bool recording_refresh_pools(Recording& r) {
+    auto make = [](VkCommandPool& pool, VkCommandBuffer& cmd) {
+        VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+        pi.queueFamilyIndex = dev.queue_family;
+        pi.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+        VkCommandPool np = VK_NULL_HANDLE;
+        if (vkCreateCommandPool(dev.device, &pi, nullptr, &np) != VK_SUCCESS) return false;
+        VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        ai.commandPool = np;
+        ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        ai.commandBufferCount = 1;
+        VkCommandBuffer nc = VK_NULL_HANDLE;
+        if (vkAllocateCommandBuffers(dev.device, &ai, &nc) != VK_SUCCESS) {
+            vkDestroyCommandPool(dev.device, np, nullptr);
+            return false;
+        }
+        if (pool) vkDestroyCommandPool(dev.device, pool, nullptr);
+        pool = np;
+        cmd = nc;
+        return true;
+    };
+    if (!make(r.pool, r.cmd) || !make(r.upload_pool, r.upload)) return false;
+    if (r.init_pool && !make(r.init_pool, r.init)) return false;
+    return true;
+}
+#endif
 
 /// (a recording slot's last submit done: before it is used again)
 void recording_wait(Recording& r) {
@@ -342,8 +385,15 @@ Recording& begin_recording(uint64_t value) {
         gpu_time_collect(r);
         gprof_collect(r.slot);
     }
+#ifdef __APPLE__
+    if (!(r.value && recording_refresh_pools(r))) {
+        vkResetCommandPool(dev.device, r.pool, 0);
+        vkResetCommandPool(dev.device, r.upload_pool, 0);
+    }
+#else
     vkResetCommandPool(dev.device, r.pool, 0);
     vkResetCommandPool(dev.device, r.upload_pool, 0);
+#endif
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(r.cmd, &bi);
@@ -1391,7 +1441,12 @@ Recording& begin_segment_recording(uint64_t value) {
         gpu_time_collect(r);
         gprof_collect(r.slot);
     }
+#ifdef __APPLE__
+    if (!(r.value && recording_refresh_pools(r)))
+        vkResetCommandPool(dev.device, r.pool, 0);
+#else
     vkResetCommandPool(dev.device, r.pool, 0);
+#endif
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(r.cmd, &bi);
@@ -2651,6 +2706,238 @@ void blit_crop(VkCommandBuffer cmd, VkImage src, uint32_t sw, uint32_t sh, const
     blit_crop_to_rect(cmd, src, sw, sh, crop, dst, dst_layout, {0, 0, dw, dh});
 }
 
+// MoltenVK's swapchain is BGRA: CAMetalLayer has no RGBA8Unorm. A blit from the game's RGBA8 is not a legal blit, and
+// MoltenVK drops it, so the window stays on the cleared black. A fragment shader writes logical RGBA into the BGRA
+// attachment, which stores it in the swapchain's order. Same formats still take the blit.
+bool molten_samples_present() {
+    if (dev.driver_id != VK_DRIVER_ID_MOLTENVK) return false;
+    const VkFormat f = dev.swap_view_format;
+    if (f == VK_FORMAT_UNDEFINED) return false;
+    return f != VK_FORMAT_R8G8B8A8_UNORM && f != VK_FORMAT_R8G8B8A8_SRGB &&
+           f != VK_FORMAT_A8B8G8R8_UNORM_PACK32 && f != VK_FORMAT_A8B8G8R8_SRGB_PACK32;
+}
+
+// Draws src's crop into the swapchain image (already TRANSFER_DST) and leaves that image TRANSFER_DST. False: the blit
+// still has to run.
+bool copy_swapchain(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t sh, const int crop[4], uint32_t index,
+                    PresentRect rect) {
+    if (!src || !rect.w || !rect.h) return false;
+    if (index >= dev.swap_views.size() || !dev.swap_views[index] || index >= dev.swap_images.size()) {
+        static bool told = false;
+        if (!told) told = true, logf("vk: present copy has no swapchain view: the picture stays a blit");
+        return false;
+    }
+    const PresentSourceRect source = present_source_rect(sw, sh, crop);
+    if (!source.w || !source.h) return false;
+    const VkFormat format = dev.swap_view_format;
+    struct Pipe {
+        VkFormat format = VK_FORMAT_UNDEFINED;
+        VkDescriptorSetLayout set = VK_NULL_HANDLE;
+        VkPipelineLayout layout = VK_NULL_HANDLE;
+        VkPipeline pipeline = VK_NULL_HANDLE;
+        VkSampler sampler = VK_NULL_HANDLE;
+        bool failed = false;
+        VkFormat bad = VK_FORMAT_UNDEFINED;
+    };
+    static Pipe pipe;
+    if (pipe.failed || pipe.bad == format) return false;
+    if (!pipe.pipeline || pipe.format != format) {
+        if (!dev.push_descriptor || !vkCmdPushDescriptorSetKHR) {
+            pipe.failed = true;
+            logf("vk: present copy needs push descriptors, which this device does not advertise");
+            return false;
+        }
+        if (!pipe.layout) {
+            VkDescriptorSetLayoutBinding bind{};
+            bind.binding = 0;
+            bind.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            bind.descriptorCount = 1;
+            bind.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+            VkDescriptorSetLayoutCreateInfo di{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+            di.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
+            di.bindingCount = 1;
+            di.pBindings = &bind;
+            if (vkCreateDescriptorSetLayout(dev.device, &di, nullptr, &pipe.set) != VK_SUCCESS) {
+                pipe.failed = true;
+                logf("vk: present copy: descriptor set layout failed");
+                return false;
+            }
+            const VkPushConstantRange range{VK_SHADER_STAGE_FRAGMENT_BIT, 0, 32};
+            VkPipelineLayoutCreateInfo li{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+            li.setLayoutCount = 1;
+            li.pSetLayouts = &pipe.set;
+            li.pushConstantRangeCount = 1;
+            li.pPushConstantRanges = &range;
+            if (vkCreatePipelineLayout(dev.device, &li, nullptr, &pipe.layout) != VK_SUCCESS) {
+                pipe.failed = true;
+                logf("vk: present copy: pipeline layout failed");
+                return false;
+            }
+            VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+            si.magFilter = si.minFilter = VK_FILTER_LINEAR;
+            si.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+            si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            si.maxLod = 0.25f;
+            if (vkCreateSampler(dev.device, &si, nullptr, &pipe.sampler) != VK_SUCCESS) {
+                pipe.failed = true;
+                logf("vk: present copy: sampler failed");
+                return false;
+            }
+        }
+        VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        VkShaderModule vert = VK_NULL_HANDLE, frag = VK_NULL_HANDLE;
+        mi.codeSize = sizeof PRESENT_COPY_VERT_SPV;
+        mi.pCode = PRESENT_COPY_VERT_SPV;
+        if (vkCreateShaderModule(dev.device, &mi, nullptr, &vert) != VK_SUCCESS) return false;
+        mi.codeSize = sizeof PRESENT_COPY_FRAG_SPV;
+        mi.pCode = PRESENT_COPY_FRAG_SPV;
+        if (vkCreateShaderModule(dev.device, &mi, nullptr, &frag) != VK_SUCCESS) {
+            vkDestroyShaderModule(dev.device, vert, nullptr);
+            return false;
+        }
+        VkPipelineShaderStageCreateInfo st[2]{{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
+                                              {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
+        st[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+        st[0].module = vert;
+        st[0].pName = "main";
+        st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+        st[1].module = frag;
+        st[1].pName = "main";
+        VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+        VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+        ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+        vp.viewportCount = vp.scissorCount = 1;
+        VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+        rs.polygonMode = VK_POLYGON_MODE_FILL;
+        rs.cullMode = VK_CULL_MODE_NONE;
+        rs.lineWidth = 1.0f;
+        VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+        VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+        VkPipelineColorBlendAttachmentState cb{};
+        cb.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT |
+                            VK_COLOR_COMPONENT_A_BIT;
+        VkPipelineColorBlendStateCreateInfo bs{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+        bs.attachmentCount = 1;
+        bs.pAttachments = &cb;
+        const VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+        VkPipelineDynamicStateCreateInfo dy{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+        dy.dynamicStateCount = 2;
+        dy.pDynamicStates = dyn;
+        VkPipelineRenderingCreateInfo ri{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+        ri.colorAttachmentCount = 1;
+        ri.pColorAttachmentFormats = &format;
+        VkGraphicsPipelineCreateInfo ci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+        ci.pNext = &ri;
+        ci.stageCount = 2;
+        ci.pStages = st;
+        ci.pVertexInputState = &vi;
+        ci.pInputAssemblyState = &ia;
+        ci.pViewportState = &vp;
+        ci.pRasterizationState = &rs;
+        ci.pMultisampleState = &ms;
+        ci.pDepthStencilState = &ds;
+        ci.pColorBlendState = &bs;
+        ci.pDynamicState = &dy;
+        ci.layout = pipe.layout;
+        VkPipeline made = VK_NULL_HANDLE;
+        const VkResult pr = vkCreateGraphicsPipelines(dev.device, VK_NULL_HANDLE, 1, &ci, nullptr, &made);
+        vkDestroyShaderModule(dev.device, vert, nullptr);
+        vkDestroyShaderModule(dev.device, frag, nullptr);
+        if (pr != VK_SUCCESS || !made) {
+            pipe.bad = format;
+            logf("vk: present copy: pipeline failed (VkResult %d, format %#x)", (int)pr, (unsigned)format);
+            return false;
+        }
+        if (pipe.pipeline) vkDestroyPipeline(dev.device, pipe.pipeline, nullptr);
+        pipe.pipeline = made;
+        pipe.format = format;
+        static bool told = false;
+        if (!told) {
+            told = true;
+            logf("vk: the swapchain format %#x is not a blit from the game's RGBA8: the picture is sampled into it",
+                 (unsigned)format);
+        }
+    }
+    VkImage dst = dev.swap_images[index];
+    if (!ui::swapchain_layout_is_color())
+        image_barrier(cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    VkRenderingAttachmentInfo ca{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    ca.imageView = dev.swap_views[index];
+    ca.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    ca.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
+    rendering.renderArea = {{0, 0}, dev.swap_extent};
+    rendering.layerCount = 1;
+    rendering.colorAttachmentCount = 1;
+    rendering.pColorAttachments = &ca;
+    vkCmdBeginRendering(cmd, &rendering);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe.pipeline);
+    VkViewport view{};
+    view.x = (float)rect.x;
+    view.y = (float)rect.y;
+    view.width = (float)rect.w;
+    view.height = (float)rect.h;
+    view.minDepth = 0.0f;
+    view.maxDepth = 1.0f;
+    vkCmdSetViewport(cmd, 0, 1, &view);
+    VkRect2D scissor{};
+    scissor.offset = {(int32_t)rect.x, (int32_t)rect.y};
+    scissor.extent = {rect.w, rect.h};
+    vkCmdSetScissor(cmd, 0, 1, &scissor);
+    const struct {
+        float src_x, src_y, src_w, src_h, dst_x, dst_y, dst_w, dst_h;
+    } pc{(float)source.x, (float)source.y, (float)source.w, (float)source.h,
+         (float)rect.x,    (float)rect.y,  (float)rect.w,    (float)rect.h};
+    static_assert(sizeof pc == 32);
+    vkCmdPushConstants(cmd, pipe.layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, &pc);
+    VkDescriptorImageInfo ii{pipe.sampler, src, VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet wr{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    wr.dstBinding = 0;
+    wr.descriptorCount = 1;
+    wr.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    wr.pImageInfo = &ii;
+    vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe.layout, 0, 1, &wr);
+    vkCmdDraw(cmd, 3, 1, 0, 0);
+    vkCmdEndRendering(cmd);
+#ifdef __APPLE__
+    // Leave COLOR_ATTACHMENT. Moving the drawable to TRANSFER_DST drops what was just stored.
+    ui::swapchain_layout_color(true);
+#else
+    image_barrier(cmd, dst, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+#endif
+    return true;
+}
+
+// MoltenVK's swapchain textures are framebuffer-only. A clear or blit of them is dropped, and one illegal clear
+// earlier in the command buffer drops the draws after it too, so the window stays black. A render pass clear is stored.
+void clear_swapchain_color(VkCommandBuffer cmd, uint32_t index, float r, float g, float b) {
+    if (index >= dev.swap_views.size() || !dev.swap_views[index] || index >= dev.swap_images.size()) return;
+    VkImage dst = dev.swap_images[index];
+    if (!ui::swapchain_layout_is_color())
+        image_barrier(cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    VkRenderingAttachmentInfo ca{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    ca.imageView = dev.swap_views[index];
+    ca.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    ca.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    ca.clearValue.color = {{r, g, b, 1.0f}};
+    VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
+    rendering.renderArea = {{0, 0}, dev.swap_extent};
+    rendering.layerCount = 1;
+    rendering.colorAttachmentCount = 1;
+    rendering.pColorAttachments = &ca;
+    vkCmdBeginRendering(cmd, &rendering);
+    vkCmdEndRendering(cmd);
+#ifdef __APPLE__
+    ui::swapchain_layout_color(true);
+#else
+    image_barrier(cmd, dst, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+#endif
+}
+
 // ---- PNG (stored deflate blocks: no compression library needed) ----
 uint32_t crc32(const uint8_t* p, size_t n, uint32_t c = 0xFFFFFFFFu) {
     static const std::array<uint32_t, 256> table = [] {
@@ -3221,8 +3508,8 @@ void do_present(const nvn_tex* t, const int crop[4]) {
         Texture* tex = t ? texture_for_present(t) : nullptr;
         static int logged_p;
         if (logged_p++ < 4)
-            logf("vk: present texture %#llx %ux%u format %#x: %s", (unsigned long long)(t ? t->gpu : 0),
-                 t ? t->d.width : 0, t ? t->d.height : 0, t ? t->d.format : 0,
+            logf("vk: present texture %#llx %ux%u format %#x, swapchain %#x: %s", (unsigned long long)(t ? t->gpu : 0),
+                 t ? t->d.width : 0, t ? t->d.height : 0, t ? t->d.format : 0, (unsigned)dev.swap_view_format,
                  tex ? (tex->gpu_written ? "rendered" : "never rendered") : "no image");
         if (tex) src = tex->image, sw = tex->width, sh = tex->height;
         // (the Insert menu's HDR set to Native: the game, told its display is HDR10, presents PQ codes in RGB10A2 (vk
@@ -3248,7 +3535,7 @@ void do_present(const nvn_tex* t, const int crop[4]) {
                                                                                         : "the SDR picture expanded to HDR10");
             }
         }
-        if (tex && !dev.offscreen && (opts.upscale || opts.sharpness || dev.hdr || wide_sides_possible())) {   // (and ultrawide's menu sides)
+        if (tex && !dev.offscreen && (opts.upscale || opts.sharpness || dev.hdr || wide_sides_possible() || molten_samples_present())) {
             // Keep the sampled view with the same cached image as the direct present, before advancing its age.
             direct_view = texture_view(tex, t, nullptr, VK_IMAGE_VIEW_TYPE_2D, ViewUse::Sample);
             tex->last_frame = texture_frame_no();
@@ -3780,6 +4067,11 @@ void present_hand_off(uint32_t index, VkFence done);
 void present_finish(VkResult res, bool on_presenter);
 std::atomic<bool> presenter_surface_lost{false};   // (the presenter thread's present: VK_ERROR_SURFACE_LOST_KHR, for present_image)
 }  // namespace
+#ifdef __APPLE__
+#define MKWVK_PRESENT_HOST 1
+#else
+#define MKWVK_PRESENT_HOST 0
+#endif
 void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkImageView view) {
     std::lock_guard lk(present_image_mu);
     static int hdr_was = -1;   // (the Insert menu's HDR as the swapchain was made for it; -1: not yet looked at)
@@ -3834,6 +4126,12 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
     if (fence_t0) fps_wait(fps_stats::kGpuWait, acquire_t0 - fence_t0);
 #ifdef _WIN32
     const uint64_t acquire_timeout = UINT64_MAX;
+#elif defined(__APPLE__)
+    // (MoltenVK answers a zero wait with VK_NOT_READY whenever it does not already hold a drawable, which is the usual
+    // case while the window is on screen. The Linux path below takes one such answer as "hidden" and then waits 0, so
+    // every later frame is left out and the window stays on the start-up fade to black. 100 ms is long enough for a
+    // drawable, and short enough that a covered window does not hold the game)
+    const uint64_t acquire_timeout = 100000000ull;
 #else
     // (linux: a Wayland compositor gives no image back while the window cannot be seen: its screen asleep, another workspace. A wait
     // without end there held the presentation thread, and with it the game, until the screen came back. 100 ms, then the window is
@@ -3853,14 +4151,22 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
     }
 #ifndef _WIN32
     if (res == VK_TIMEOUT || res == VK_NOT_READY) {
+#ifdef __APPLE__
+        static int logged;
+        if (logged++ < 4)
+            logf("vk: no swapchain image within 100 ms (VkResult %d): this frame is left out", (int)res);
+#else
         if (!unseen) logf("vk: the window is not shown (no image back in 100 ms): frames are not shown until it is");
         unseen = true;
+#endif
         return;
     }
+#ifndef __APPLE__
     if (unseen && (res == VK_SUCCESS || res == VK_SUBOPTIMAL_KHR)) {
         unseen = false;
         logf("vk: the window is shown again");
     }
+#endif
 #endif
     if (res == VK_ERROR_OUT_OF_DATE_KHR) {
         present_thread_drain();
@@ -3875,17 +4181,31 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     if (vkBeginCommandBuffer(f.cmd, &bi) == VK_ERROR_DEVICE_LOST) device_lost();
     VkImage dst = dev.swap_images[index];
+    ui::swapchain_layout_reset();
     full_barrier(f.cmd);   // (after the game's work for the frame: earlier submits on this queue)
+#ifdef __APPLE__
+    // A MoltenVK drawable used as TRANSFER_DST is dropped for the rest of the command buffer, draws included.
+    image_barrier(f.cmd, dst, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    ui::swapchain_layout_color(true);
+#else
     image_barrier(f.cmd, dst, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+#endif
     const PresentAspect aspect{src && host && host->aspect_ratio ? host->aspect_ratio() : 0.0f};
     const PresentRect rect = present_rect(sw, sh, crop, dev.swap_extent.width, dev.swap_extent.height, aspect);
     [[maybe_unused]] uint32_t trace_route = 0; // direct; 1 scaled, 2 clear, 3 HDR conversion
     const bool has_bars = rect.x || rect.y || rect.w != dev.swap_extent.width || rect.h != dev.swap_extent.height;
     if (has_bars) {
+#if MKWVK_PRESENT_HOST
+        clear_swapchain_color(f.cmd, index, 0.0f, 0.0f, 0.0f);
+#else
         const VkClearColorValue black{0.0f, 0.0f, 0.0f, 1.0f};
         const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         vkCmdClearColorImage(f.cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
+#endif
         // The following blit overlaps the clear in the content rectangle.
+#if MKWVK_PRESENT_HOST
+        if (!ui::swapchain_layout_is_color())
+#endif
         image_barrier(f.cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     }
     // (Native HDR: scaled in 10 bits (framegen_scale's pq), and read by the HDR pass in every case, through the view in the
@@ -3901,21 +4221,42 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
     if (hdr_image) {
         trace_route = 3;
         full_barrier(f.cmd);
+#if MKWVK_PRESENT_HOST
+        (void)hdr_image;
+#else
         blit_crop_to_rect(f.cmd, hdr_image, rect.w, rect.h, nullptr, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, rect);
+#endif
     } else if (scaled) {
         trace_route = 1;
-        blit_crop_to_rect(f.cmd, scaled, rect.w, rect.h, nullptr, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, rect);
+        // The scaled image is RGBA storage. On MoltenVK the last hop samples the game texture instead: that image is
+        // the one created to be sampled, and the blit into a BGRA swapchain would be dropped.
+        if (!(view && molten_samples_present() && copy_swapchain(f.cmd, view, sw, sh, crop, index, rect)))
+#if MKWVK_PRESENT_HOST
+            ;
+#else
+            blit_crop_to_rect(f.cmd, scaled, rect.w, rect.h, nullptr, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, rect);
+#endif
     } else if (src && !native_pq) {
-        blit_crop_to_rect(f.cmd, src, sw, sh, crop, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, rect);
+        if (!(view && molten_samples_present() && copy_swapchain(f.cmd, view, sw, sh, crop, index, rect)))
+#if MKWVK_PRESENT_HOST
+            ;
+#else
+            blit_crop_to_rect(f.cmd, src, sw, sh, crop, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, rect);
+#endif
     } else {
         if (src) {   // (Native, unscaled, and the HDR pass not made: black, said once, rather than the picture converted)
             static bool told;
             if (!told) told = true, logf("vk: HDR: Native's picture could not go through the HDR pass: shown black");
         }
         trace_route = 2;
+#if MKWVK_PRESENT_HOST
+        // Visible on its own. The start-up screen draws over it; if that draw is dropped the window is still not black.
+        clear_swapchain_color(f.cmd, index, 0.85f, 0.22f, 0.05f);
+#else
         const VkClearColorValue black{};
         const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         vkCmdClearColorImage(f.cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
+#endif
     }
     if (src && framelog_on()) {
         static uint32_t seq;
@@ -3963,7 +4304,10 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
         }
     }
     menu_record(f.cmd, index, dev.swap_extent.width, dev.swap_extent.height);   // (hookshot) Dear ImGui's overlays, over all of it
-    image_barrier(f.cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+    // MoltenVK presents a blank drawable if the stored color attachment is first moved to TRANSFER_DST.
+    const VkImageLayout present_from = ui::swapchain_layout_is_color() ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+                                                                       : VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    image_barrier(f.cmd, dst, present_from, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
     if (vkEndCommandBuffer(f.cmd) == VK_ERROR_DEVICE_LOST) device_lost();
     // after the image's acquisition. (Not on the timeline: one queue runs submits in order, and a wait for a value
     // another thread had counted but not yet submitted blocked the queue for good)
@@ -4050,6 +4394,22 @@ static bool present_out(uint32_t index, std::unique_lock<std::mutex>& qk) {
     pi.pSwapchains = &dev.swapchain;
     pi.pImageIndices = &index;
     antilag_present();   // (AMD Anti-Lag 2: the frame's present stage)
+#ifdef __APPLE__
+    // MoltenVK commits the drawable on the main thread. A present from the presentation thread is accepted and then
+    // never reaches the layer, so the window stays black.
+    struct PresentJob {
+        VkQueue queue;
+        const VkPresentInfoKHR* info;
+        VkResult result;
+    } job{dev.present_queue ? dev.present_queue : dev.queue, &pi, VK_SUCCESS};
+    qk.unlock();
+    if (pthread_main_np()) job.result = vkQueuePresentKHR(job.queue, job.info);
+    else dispatch_sync_f(dispatch_get_main_queue(), &job, [](void* ctx) {
+        auto* j = static_cast<PresentJob*>(ctx);
+        j->result = vkQueuePresentKHR(j->queue, j->info);
+    });
+    res = job.result;
+#else
     // (hookshot) vkQueuePresentKHR blocked a quarter of the display thread's time with frame interpolation at 4x (a 14700K and an
     // RTX 5070 Ti), and with the queue's lock held there the game's main thread waited ~9% of its time and the presentation thread
     // ~15% to submit. With a queue of their own (dev.present_queue, a compute family's: vk_main.cpp create_device) the presents go
@@ -4074,6 +4434,7 @@ static bool present_out(uint32_t index, std::unique_lock<std::mutex>& qk) {
         const bool waited_gpu = copy && !copy_was_done && copy_done();
         fps_wait(waited_gpu ? fps_stats::kGpuWait : fps_stats::kPace, fps_clock() - present_t0);
     }
+#endif
     if (res == VK_ERROR_DEVICE_LOST) device_lost();
     reflex_presented();
     if (res == VK_ERROR_SURFACE_LOST_KHR) {

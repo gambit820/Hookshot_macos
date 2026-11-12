@@ -100,7 +100,53 @@ __attribute__((naked, noreturn)) static void recomp_sj_longjmp(void **buf, int v
         "jmpq *72(%rcx)\n\t");
 }
 
-#else
+#elif defined(__aarch64__) || defined(__arm64__)
+/* (arm64, Apple and System V) buf in x0, the value in w1. Callee-saved only: x19-x28, x29, x30, sp, d8-d15, and
+   fpcr. There is no return address on the stack, so the saved sp is the sp at the call. 176 bytes of the 256. */
+__attribute__((naked, returns_twice)) int recomp_sj_setjmp(void **buf) {
+    __asm__ volatile(
+        "mov x2, sp\n\t"
+        "stp x19, x20, [x0, #0]\n\t"
+        "stp x21, x22, [x0, #16]\n\t"
+        "stp x23, x24, [x0, #32]\n\t"
+        "stp x25, x26, [x0, #48]\n\t"
+        "stp x27, x28, [x0, #64]\n\t"
+        "stp x29, x30, [x0, #80]\n\t"
+        "str x2, [x0, #96]\n\t"
+        "stp d8, d9, [x0, #104]\n\t"
+        "stp d10, d11, [x0, #120]\n\t"
+        "stp d12, d13, [x0, #136]\n\t"
+        "stp d14, d15, [x0, #152]\n\t"
+        "mrs x2, fpcr\n\t"
+        "str x2, [x0, #168]\n\t"
+        "mov w0, #0\n\t"
+        "ret\n\t");
+}
+
+__attribute__((naked, noreturn)) static void recomp_sj_longjmp(void **buf, int value) {
+    __asm__ volatile(
+        "ldp x19, x20, [x0, #0]\n\t"
+        "ldp x21, x22, [x0, #16]\n\t"
+        "ldp x23, x24, [x0, #32]\n\t"
+        "ldp x25, x26, [x0, #48]\n\t"
+        "ldp x27, x28, [x0, #64]\n\t"
+        "ldp x29, x30, [x0, #80]\n\t"
+        "ldr x2, [x0, #96]\n\t"
+        "ldp d8, d9, [x0, #104]\n\t"
+        "ldp d10, d11, [x0, #120]\n\t"
+        "ldp d12, d13, [x0, #136]\n\t"
+        "ldp d14, d15, [x0, #152]\n\t"
+        "ldr x3, [x0, #168]\n\t"
+        "msr fpcr, x3\n\t"
+        "mov w0, w1\n\t"
+        "cbnz w0, 1f\n\t"
+        "mov w0, #1\n\t"
+        "1:\n\t"
+        "mov sp, x2\n\t"
+        "ret\n\t");
+}
+
+#elif defined(__x86_64__) || defined(_M_X64)
 /* (linux) the System V ABI's: the buffer as above, its callee-saved registers only (rbx rbp r12-r15: rdi, rsi and the
    xmm registers are the caller's to keep there), buf in rdi and the value in esi */
 __attribute__((naked, returns_twice)) int recomp_sj_setjmp(void **buf) {

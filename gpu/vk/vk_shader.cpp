@@ -548,7 +548,9 @@ Shader::Profile make_profile() {
     Shader::Profile p{};
     p.supported_spirv = 0x00010600;
     p.unified_descriptor_binding = true;
-    p.support_descriptor_aliasing = true;
+    // (MoltenVK cannot put two descriptor arrays on one binding. The layout already has one descriptor per binding,
+    // and the translator's non-aliasing path reads the other widths out of the 32-bit view.)
+    p.support_descriptor_aliasing = dev.driver_id != VK_DRIVER_ID_MOLTENVK;
     p.support_int8 = p.support_int16 = p.support_int64 = true;
     p.support_uniform_and_storage_buffer_8bit = p.support_storage_buffer_8bit = true;
     p.support_uniform_and_storage_buffer_16bit = p.support_storage_buffer_16bit = true;
@@ -1150,7 +1152,8 @@ uint64_t translator_stamp() {
                               getenv("RX_VK_WARP64") ? 1u : 0u,
                               // (and where the translation starts a storage binding: offsets are counted from there, so a cache
                               // made on a 16-aligned GPU is no use on a 64-aligned one in the same folder, a laptop's two GPUs)
-                              (uint32_t)storage_binding_align()};
+                              (uint32_t)storage_binding_align(),
+                              profile().support_descriptor_aliasing ? 1u : 0u};
     add(lanes, sizeof lanes);
     // (k10) f16 lowered to f32 on a GPU without f16 shaders (host_info): only then, so other GPUs keep their caches
     if (!dev.vk12.shaderFloat16) {
